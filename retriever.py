@@ -24,7 +24,7 @@ EMBED_MODEL = "nomic-embed-text"
 COLLECTION = "docrag"
 
 # How many chunks to return per retriever
-TOP_K = 8
+TOP_K = 12
 # MMR fetch_k: fetch more candidates, then diversify down to TOP_K
 MMR_FETCH_K = TOP_K * 4
 # MMR lambda: 1.0 = pure similarity, 0.0 = pure diversity. 0.7 = balanced.

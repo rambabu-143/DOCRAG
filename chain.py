@@ -17,7 +17,7 @@ LLM_MODEL = "llama3.1:8b"
 # num_predict: max output tokens (-1 = unlimited, 1024 is safe for detailed answers)
 LLM_OPTIONS = dict(
     temperature=0,
-    num_ctx=8192,
+    num_ctx=16384,   # 12 chunks × ~1200 chars each needs more headroom
     num_predict=1024,
 )
 

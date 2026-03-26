@@ -1,14 +1,17 @@
 """
-ingest.py — Load PDFs with Docling, clean, chunk, embed, store in ChromaDB.
+ingest.py — Load PDFs with Docling, filter noise, embed, store in ChromaDB.
 
-Industrial-standard pipeline:
-- Docling: deep layout analysis → clean Markdown (removes headers/footers,
-  structures tables, preserves headings hierarchy)
-- MarkdownHeaderTextSplitter: chunks follow document structure (headings),
-  not arbitrary character counts
-- RecursiveCharacterTextSplitter: secondary split for oversized chunks
-- Stable MD5 chunk IDs → safe to re-run (upsert, no duplicates)
-- Metadata preserved: source filename + header breadcrumb on every chunk
+What was wrong before:
+- Docling already returns semantic chunks (206 for a 61-page doc)
+- We were joining them ALL back into one blob and re-splitting — destroying structure
+- TOC entries (full of "......." dots) were indexed as real content
+
+Fixed pipeline:
+- Use Docling's own HierarchicalChunker chunks directly
+- Filter noise: TOC dots, blank chunks, page-number-only lines
+- Extract section heading from Docling's dl_meta for rich metadata
+- RecursiveCharacterTextSplitter only as safety net for oversized chunks
+- Stable MD5 IDs → safe to re-run
 """
 
 import hashlib
@@ -18,7 +21,8 @@ import sys
 from pathlib import Path
 
 from langchain_docling import DoclingLoader
-from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings
 from rich.console import Console
@@ -30,155 +34,173 @@ CHUNKS_FILE = PDF_DIR / "chunks.json"
 EMBED_MODEL = "nomic-embed-text"
 COLLECTION = "docrag"
 
-# Secondary split size — catches any sections too large after header split
-CHUNK_SIZE = 1000
+# Only split further if Docling chunk exceeds this
+MAX_CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 150
-
-# Markdown heading levels to split on
-HEADERS_TO_SPLIT = [
-    ("#", "h1"),
-    ("##", "h2"),
-    ("###", "h3"),
-    ("####", "h4"),
-]
 
 console = Console()
 
 
-def clean_markdown(text: str) -> str:
-    """
-    Remove common PDF noise from Docling's markdown output:
-    - Isolated page numbers (e.g. "- 12 -", "Page 12", "12\n")
-    - Repetitive header/footer patterns
-    - Excessive blank lines (3+ → 2)
-    - Hyphenated line-break artifacts (re-join split words)
-    """
-    # Remove page number patterns
-    text = re.sub(r'\n\s*-\s*\d+\s*-\s*\n', '\n', text)       # - 12 -
-    text = re.sub(r'\nPage\s+\d+\s*(of\s+\d+)?\s*\n', '\n', text, flags=re.IGNORECASE)
-    text = re.sub(r'\n\d+\s*\n', '\n', text)                    # lone numbers on a line
+# ── Noise filters ─────────────────────────────────────────────────────────────
 
-    # Re-join hyphenated words broken across lines
+def is_noise(text: str) -> bool:
+    """Return True if this chunk is TOC/header/footer noise, not real content."""
+    stripped = text.strip()
+
+    if len(stripped) < 30:
+        return True  # too short to be useful
+
+    # TOC lines: lots of dots (table of contents)
+    dot_ratio = stripped.count('.') / max(len(stripped), 1)
+    if dot_ratio > 0.3:
+        return True
+
+    # Pure page number lines
+    if re.fullmatch(r'[\d\s\-–|/]+', stripped):
+        return True
+
+    # Only whitespace / dashes
+    if re.fullmatch(r'[\s\-_=*]+', stripped):
+        return True
+
+    return False
+
+
+def clean_text(text: str) -> str:
+    """Light cleaning: fix hyphenation, normalize whitespace."""
+    # Re-join hyphenated line breaks
     text = re.sub(r'(\w)-\n(\w)', r'\1\2', text)
-
-    # Normalize excessive whitespace
+    # Collapse 3+ blank lines to 2
     text = re.sub(r'\n{3,}', '\n\n', text)
+    # Collapse multiple spaces
     text = re.sub(r'[ \t]{2,}', ' ', text)
-
     return text.strip()
 
 
-def load_and_clean_pdfs(pdf_dir: Path):
+# ── Metadata helpers ───────────────────────────────────────────────────────────
+
+def extract_section(doc: Document) -> str:
+    """Pull heading breadcrumb from Docling's dl_meta."""
+    try:
+        headings = doc.metadata.get("dl_meta", {}).get("headings", [])
+        if headings:
+            # Take the last (most specific) heading, trim if too long
+            heading = headings[-1].strip()
+            return heading[:120] if len(heading) > 120 else heading
+    except Exception:
+        pass
+    return ""
+
+
+def extract_page(doc: Document) -> int | None:
+    """Extract page number from Docling's provenance metadata."""
+    try:
+        items = doc.metadata.get("dl_meta", {}).get("doc_items", [])
+        if items:
+            prov = items[0].get("prov", [])
+            if prov:
+                return prov[0].get("page_no")
+    except Exception:
+        pass
+    return None
+
+
+# ── Main pipeline ──────────────────────────────────────────────────────────────
+
+def load_pdf_chunks(pdf_path: Path) -> list[Document]:
     """
-    Use DoclingLoader to convert each PDF to clean Markdown,
-    then apply additional cleaning. Returns list of (filename, markdown) tuples.
+    Load one PDF via Docling. Returns its semantic chunks,
+    filtered and cleaned, with rich metadata.
     """
-    pdf_files = sorted(pdf_dir.glob("*.pdf"))
-    if not pdf_files:
-        console.print("[red]No PDF files found.[/red]")
-        sys.exit(1)
+    loader = DoclingLoader(file_path=str(pdf_path))
+    raw_docs = loader.load()
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=MAX_CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
 
     results = []
-    for pdf_path in pdf_files:
-        console.print(f"  [dim]Processing:[/dim] {pdf_path.name}")
-        loader = DoclingLoader(file_path=str(pdf_path))
-        docs = loader.load()
+    for doc in raw_docs:
+        text = clean_text(doc.page_content)
 
-        # Docling may return multiple docs per file — join them
-        full_text = "\n\n".join(d.page_content for d in docs)
-        cleaned = clean_markdown(full_text)
+        if is_noise(text):
+            continue
 
-        results.append((pdf_path.name, cleaned))
-        console.print(f"  [green]✓[/green] {pdf_path.name} — {len(cleaned):,} chars after cleaning")
+        # If Docling chunk is still too large, split further
+        if len(text) > MAX_CHUNK_SIZE:
+            sub_chunks = splitter.split_documents([Document(
+                page_content=text,
+                metadata=doc.metadata,
+            )])
+            docs_to_add = sub_chunks
+        else:
+            docs_to_add = [Document(page_content=text, metadata=doc.metadata)]
+
+        for d in docs_to_add:
+            section = extract_section(d)
+            page = extract_page(d)
+            d.metadata = {
+                "source": pdf_path.name,
+                "section": section,
+                "page": page,
+            }
+            results.append(d)
 
     return results
 
 
-def chunk_documents(filename: str, markdown: str):
-    """
-    Two-stage chunking:
-    1. MarkdownHeaderTextSplitter — respects document structure
-    2. RecursiveCharacterTextSplitter — handles oversized sections
-    """
-    from langchain_core.documents import Document
-
-    # Stage 1: split by headings
-    header_splitter = MarkdownHeaderTextSplitter(
-        headers_to_split_on=HEADERS_TO_SPLIT,
-        strip_headers=False,  # keep headers in chunk for context
-    )
-    header_chunks = header_splitter.split_text(markdown)
-
-    # Stage 2: secondary size-based split for large sections
-    size_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        separators=["\n\n", "\n", ". ", " ", ""],
-    )
-    final_chunks = size_splitter.split_documents(header_chunks)
-
-    # Inject source filename into every chunk's metadata
-    for chunk in final_chunks:
-        chunk.metadata["source"] = filename
-        # Build a readable breadcrumb from header metadata
-        breadcrumb = " > ".join(
-            chunk.metadata[k]
-            for k in ("h1", "h2", "h3", "h4")
-            if chunk.metadata.get(k)
-        )
-        if breadcrumb:
-            chunk.metadata["section"] = breadcrumb
-
-    return final_chunks
-
-
-def make_chunk_id(chunk) -> str:
+def make_chunk_id(chunk: Document) -> str:
     key = (
         chunk.page_content
         + chunk.metadata.get("source", "")
         + chunk.metadata.get("section", "")
+        + str(chunk.metadata.get("page", ""))
     )
     return hashlib.md5(key.encode()).hexdigest()
 
 
 def ingest():
-    console.rule("[bold cyan]DocRAG Ingest (Docling)[/bold cyan]")
+    console.rule("[bold cyan]DocRAG Ingest[/bold cyan]")
 
-    # 1. Load + clean PDFs
-    console.print("\n[bold]Loading & cleaning PDFs with Docling...[/bold]")
-    console.print("  [dim](First run downloads layout models — may take a minute)[/dim]\n")
-    pdf_data = load_and_clean_pdfs(PDF_DIR)
+    pdf_files = sorted(PDF_DIR.glob("*.pdf"))
+    if not pdf_files:
+        console.print("[red]No PDFs found.[/red]")
+        sys.exit(1)
 
-    # 2. Chunk
-    console.print("\n[bold]Chunking by document structure...[/bold]")
-    all_chunks = []
-    for filename, markdown in pdf_data:
-        chunks = chunk_documents(filename, markdown)
+    # 1. Load + filter + clean
+    console.print("\n[bold]Loading PDFs with Docling...[/bold]")
+    console.print("  [dim](First run may download layout models)[/dim]\n")
+
+    all_chunks: list[Document] = []
+    for pdf_path in pdf_files:
+        console.print(f"  [dim]Processing:[/dim] {pdf_path.name}")
+        chunks = load_pdf_chunks(pdf_path)
         all_chunks.extend(chunks)
-        console.print(f"  [cyan]{len(chunks)}[/cyan] chunks ← {filename}")
+        console.print(f"  [green]✓[/green] {pdf_path.name} → [cyan]{len(chunks)}[/cyan] clean chunks")
 
     console.print(f"\n  Total: [cyan]{len(all_chunks)}[/cyan] chunks\n")
 
-    # 3. Save for BM25
-    console.print("[bold]Saving chunks for BM25 index...[/bold]")
+    # 2. Save for BM25
+    console.print("[bold]Saving chunks for BM25...[/bold]")
     CHUNKS_FILE.write_text(json.dumps([
         {"page_content": c.page_content, "metadata": c.metadata}
         for c in all_chunks
     ], indent=2))
     console.print(f"  Saved → {CHUNKS_FILE.name}\n")
 
-    # 4. Embed + store
-    console.print("[bold]Embedding and storing in ChromaDB...[/bold]")
+    # 3. Embed + store
+    console.print("[bold]Embedding into ChromaDB...[/bold]")
     console.print(f"  Model: [cyan]{EMBED_MODEL}[/cyan] via Ollama\n")
 
     embeddings = OllamaEmbeddings(model=EMBED_MODEL)
     ids = [make_chunk_id(c) for c in all_chunks]
 
-    # Wipe old collection and rebuild fresh
     if CHROMA_DIR.exists():
         import shutil
         shutil.rmtree(CHROMA_DIR)
-        console.print("  [dim]Cleared old ChromaDB collection[/dim]")
+        console.print("  [dim]Cleared old ChromaDB[/dim]")
 
     Chroma.from_documents(
         documents=all_chunks,
@@ -188,11 +210,9 @@ def ingest():
         ids=ids,
     )
 
-    console.rule("[bold green]Ingest Complete[/bold green]")
-    console.print(
-        f"  [green]✓[/green] {len(all_chunks)} clean chunks indexed\n"
-        f"  Run [cyan]uv run main.py query[/cyan] to start."
-    )
+    console.rule("[bold green]Done[/bold green]")
+    console.print(f"  [green]✓[/green] {len(all_chunks)} chunks indexed\n"
+                  f"  Run [cyan]uv run main.py query[/cyan]")
 
 
 if __name__ == "__main__":
