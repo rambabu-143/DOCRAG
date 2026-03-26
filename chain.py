@@ -44,12 +44,13 @@ Answer:"""
 
 
 def format_docs_with_sources(docs) -> str:
-    """Format retrieved chunks with source labels for the prompt."""
+    """Format retrieved chunks with source + section breadcrumb for the prompt."""
     parts = []
     for doc in docs:
         source = doc.metadata.get("source", "unknown")
-        page = doc.metadata.get("page", "?")
-        parts.append(f"[Source: {source}, Page {page}]\n{doc.page_content}")
+        section = doc.metadata.get("section", "")
+        label = f"[Source: {source}" + (f" | Section: {section}" if section else "") + "]"
+        parts.append(f"{label}\n{doc.page_content}")
     return "\n\n---\n\n".join(parts)
 
 

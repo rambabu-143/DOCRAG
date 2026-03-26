@@ -93,19 +93,18 @@ def _ask(chain, retriever, question: str):
 
     # Print sources table
     seen: set[tuple] = set()
-    unique_sources = []
-    for doc in docs:
-        key = (doc.metadata.get("source", "?"), doc.metadata.get("page", "?"))
-        if key not in seen:
-            seen.add(key)
-            unique_sources.append((key[0], key[1]))
 
-    if unique_sources:
+    if docs:
         table = Table(title="Sources", show_header=True, header_style="bold dim")
         table.add_column("Document", style="cyan")
-        table.add_column("Page", style="yellow", justify="right")
-        for src, page in unique_sources:
-            table.add_row(src, str(page))
+        table.add_column("Section", style="dim")
+        for doc in docs:
+            src = doc.metadata.get("source", "?")
+            section = doc.metadata.get("section", "—")
+            key = (src, section)
+            if key not in seen:
+                seen.add(key)
+                table.add_row(src, section)
         console.print(table)
 
     console.print()

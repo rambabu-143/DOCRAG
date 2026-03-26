@@ -12,6 +12,8 @@ dependencies = [
     "chromadb>=0.5",
     "rank-bm25>=0.2",
     "rich>=13",
+    "docling>=2.82.0",
+    "langchain-docling>=2.0.0",
 ]
 
 [tool.uv]
