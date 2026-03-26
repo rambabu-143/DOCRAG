@@ -11,7 +11,7 @@ from langchain_ollama import ChatOllama
 
 from retriever import load_retriever
 
-LLM_MODEL = "llama3.2"
+LLM_MODEL = "llama3.1:8b"
 
 # num_ctx: expand context window so all retrieved chunks + answer fit (default is 2048 — too small)
 # num_predict: max output tokens (-1 = unlimited, 1024 is safe for detailed answers)
