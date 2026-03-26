@@ -1,0 +1,17 @@
+# Virtual environment
+.venv/
+
+# Generated at runtime — re-created by running ingest
+chroma_db/
+chunks.json
+
+# PDFs (large binary files — store separately)
+*.pdf
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
