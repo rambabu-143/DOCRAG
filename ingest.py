@@ -44,23 +44,40 @@ console = Console()
 # ── Noise filters ─────────────────────────────────────────────────────────────
 
 def is_noise(text: str) -> bool:
-    """Return True if this chunk is TOC/header/footer noise, not real content."""
+    """Return True if this chunk is noise — TOC, garbled tables, UI artifacts."""
     stripped = text.strip()
 
-    if len(stripped) < 30:
-        return True  # too short to be useful
-
-    # TOC lines: lots of dots (table of contents)
-    dot_ratio = stripped.count('.') / max(len(stripped), 1)
-    if dot_ratio > 0.3:
+    # Too short to be useful
+    if len(stripped) < 100:
         return True
 
-    # Pure page number lines
+    # TOC lines: lots of dots
+    dot_ratio = stripped.count('.') / max(len(stripped), 1)
+    if dot_ratio > 0.25:
+        return True
+
+    # Pure page numbers / dashes
     if re.fullmatch(r'[\d\s\-–|/]+', stripped):
         return True
 
-    # Only whitespace / dashes
-    if re.fullmatch(r'[\s\-_=*]+', stripped):
+    # Garbled table/screenshot dumps: high digit ratio
+    digit_chars = sum(c.isdigit() for c in stripped)
+    if digit_chars / max(len(stripped), 1) > 0.2:
+        return True
+
+    # Low alpha ratio — garbled OCR, UI nav artifacts, symbol dumps
+    alpha_chars = sum(c.isalpha() for c in stripped)
+    if alpha_chars / max(len(stripped), 1) < 0.45:
+        return True
+
+    # Repeated standalone numbers — screenshot/table row dumps (e.g. "90 90 90 0.0 GB")
+    standalone_nums = re.findall(r'\b\d+\b', stripped)
+    if len(standalone_nums) > 8:
+        return True
+
+    # UI navigation symbols
+    nav_symbols = sum(stripped.count(s) for s in ['«', '»', '›', '‹', '☰', '⊕', '⊗'])
+    if nav_symbols > 2:
         return True
 
     return False
