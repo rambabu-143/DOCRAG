@@ -17,25 +17,21 @@ LLM_MODEL = "llama3.1:8b"
 # num_predict: max output tokens (-1 = unlimited, 1024 is safe for detailed answers)
 LLM_OPTIONS = dict(
     temperature=0,
-    num_ctx=16384,   # 12 chunks × ~1200 chars each needs more headroom
-    num_predict=1024,
+    num_ctx=32768,   # k=10 chunks × 2500 chars ≈ 6k tokens context — 32k gives plenty of headroom
+    num_predict=-1,
 )
 
 # Grounded, citation-aware prompt — prevents hallucination outside the docs
 RAG_PROMPT = ChatPromptTemplate.from_template(
-    """You are a precise technical assistant. Your job is to answer questions using ONLY the provided document context.
+    """Answer the question using ONLY the context below. Do not add information that is not in the context.
 
-Rules:
-- Answer strictly from the context. Do not guess or add outside knowledge.
-- If the answer is not in the context, say: "I couldn't find that in the provided documents."
-- Always cite the source document and page number for every claim.
-- Be thorough and complete — do not cut your answer short. Cover all relevant details from the context.
-- Use bullet points or numbered lists when the answer has multiple parts or steps.
+- The answer may be spread across multiple chunks — collect all relevant items before answering.
+- If listing items (types, steps, options), include every one you find. Do not stop early.
+- Cite the source document and section for each item.
+- If the answer is not in the context at all, say "Not found in the documents."
 
----
 Context:
 {context}
----
 
 Question: {question}
 
@@ -56,21 +52,14 @@ def format_docs_with_sources(docs) -> str:
 
 def build_chain():
     """
-    Returns (chain, retriever) tuple.
-    Retriever is returned separately so callers can show sources.
+    Returns (answer_chain, retriever) tuple.
+    answer_chain takes {"context": str, "question": str} — no internal retrieval,
+    so callers retrieve once and pass context directly (avoids double retrieval).
     """
     retriever = load_retriever()
     llm = ChatOllama(model=LLM_MODEL, **LLM_OPTIONS)
 
-    # LCEL chain: retrieve → format → prompt → LLM → parse
-    chain = (
-        {
-            "context": retriever | format_docs_with_sources,
-            "question": RunnablePassthrough(),
-        }
-        | RAG_PROMPT
-        | llm
-        | StrOutputParser()
-    )
+    # No retriever in chain — caller passes pre-retrieved context
+    answer_chain = RAG_PROMPT | llm | StrOutputParser()
 
-    return chain, retriever
+    return answer_chain, retriever

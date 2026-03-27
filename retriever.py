@@ -1,10 +1,10 @@
 """
-retriever.py — Hybrid retrieval: ChromaDB MMR (semantic) + BM25 (keyword).
+retriever.py — Hybrid retrieval: ChromaDB (semantic) + BM25 (keyword) + chunk expansion.
 
-EnsembleRetriever fuses both signals via Reciprocal Rank Fusion (RRF):
-- Semantic catches paraphrasing and conceptual matches
-- BM25 catches exact keywords, acronyms, section names
-- MMR ensures diversity (no near-duplicate chunks)
+EnsembleRetriever fuses both signals via Reciprocal Rank Fusion (RRF).
+Chunk expansion: after retrieval, sibling chunks from the same source+section
+are automatically added so split sections (e.g. "6 SDX Virtual Folder Types"
+across 3 chunks) are never incomplete.
 """
 
 import json
@@ -22,16 +22,55 @@ CHUNKS_FILE = Path(__file__).parent / "chunks.json"
 EMBED_MODEL = "nomic-embed-text"
 COLLECTION = "docrag"
 
-TOP_K = 8
-MMR_FETCH_K = TOP_K * 4
-MMR_LAMBDA = 0.7
+TOP_K = 10
 
 
-def load_retriever() -> EnsembleRetriever:
+def expand_chunks(retrieved: list[Document], all_chunks: list[Document]) -> list[Document]:
+    """
+    For each retrieved chunk, add its immediate neighbors (±1 index) from
+    the same source document. This ensures sibling chunks from the same
+    section are never left out due to top-k cutoff.
+    """
+    # Build a lookup: (source, page_content) -> index in all_chunks
+    content_to_idx: dict[str, int] = {
+        f"{c.metadata.get('source', '')}||{c.page_content}": i
+        for i, c in enumerate(all_chunks)
+    }
+
+    seen: set[str] = set()
+    expanded: list[Document] = []
+
+    def add(doc: Document):
+        key = f"{doc.metadata.get('source', '')}||{doc.page_content}"
+        if key not in seen:
+            seen.add(key)
+            expanded.append(doc)
+
+    for doc in retrieved:
+        add(doc)
+        key = f"{doc.metadata.get('source', '')}||{doc.page_content}"
+        idx = content_to_idx.get(key)
+        if idx is None:
+            continue
+        src = doc.metadata.get("source", "")
+        # Add previous neighbor if same source
+        if idx > 0 and all_chunks[idx - 1].metadata.get("source") == src:
+            add(all_chunks[idx - 1])
+        # Add next neighbor if same source
+        if idx < len(all_chunks) - 1 and all_chunks[idx + 1].metadata.get("source") == src:
+            add(all_chunks[idx + 1])
+
+    return expanded
+
+
+def load_retriever():
     if not CHROMA_DIR.exists():
         raise FileNotFoundError("ChromaDB not found. Run 'uv run main.py ingest' first.")
     if not CHUNKS_FILE.exists():
         raise FileNotFoundError("chunks.json not found. Run 'uv run main.py ingest' first.")
+
+    raw = json.loads(CHUNKS_FILE.read_text())
+    all_chunks = [Document(page_content=r["page_content"], metadata=r["metadata"]) for r in raw]
 
     embeddings = OllamaEmbeddings(model=EMBED_MODEL)
     chroma = Chroma(
@@ -40,16 +79,25 @@ def load_retriever() -> EnsembleRetriever:
         collection_name=COLLECTION,
     )
     semantic_retriever = chroma.as_retriever(
-        search_type="mmr",
-        search_kwargs={"k": TOP_K, "fetch_k": MMR_FETCH_K, "lambda_mult": MMR_LAMBDA},
+        search_type="similarity",
+        search_kwargs={"k": TOP_K},
     )
 
-    raw = json.loads(CHUNKS_FILE.read_text())
-    docs = [Document(page_content=r["page_content"], metadata=r["metadata"]) for r in raw]
-    bm25_retriever = BM25Retriever.from_documents(docs)
+    bm25_retriever = BM25Retriever.from_documents(all_chunks)
     bm25_retriever.k = TOP_K
 
-    return EnsembleRetriever(
+    ensemble = EnsembleRetriever(
         retrievers=[semantic_retriever, bm25_retriever],
-        weights=[0.6, 0.4],
+        weights=[0.85, 0.15],
     )
+
+    # Wrap ensemble with chunk expansion
+    class ExpandingRetriever:
+        def invoke(self, query: str) -> list[Document]:
+            docs = ensemble.invoke(query)
+            return expand_chunks(docs, all_chunks)
+
+        def __getattr__(self, name):
+            return getattr(ensemble, name)
+
+    return ExpandingRetriever()

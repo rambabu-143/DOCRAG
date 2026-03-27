@@ -35,8 +35,8 @@ EMBED_MODEL = "nomic-embed-text"
 COLLECTION = "docrag"
 
 # Only split further if Docling chunk exceeds this
-MAX_CHUNK_SIZE = 1200
-CHUNK_OVERLAP = 150
+MAX_CHUNK_SIZE = 2500
+CHUNK_OVERLAP = 200
 
 console = Console()
 
@@ -48,31 +48,34 @@ def is_noise(text: str) -> bool:
     stripped = text.strip()
 
     # Too short to be useful
-    if len(stripped) < 100:
+    if len(stripped) < 40:
         return True
 
     # TOC lines: lots of dots
     dot_ratio = stripped.count('.') / max(len(stripped), 1)
-    if dot_ratio > 0.25:
+    if dot_ratio > 0.35:
         return True
 
     # Pure page numbers / dashes
     if re.fullmatch(r'[\d\s\-–|/]+', stripped):
         return True
 
-    # Garbled table/screenshot dumps: high digit ratio
+    # Garbled table/screenshot dumps: very high digit ratio
+    # Raised from 0.2 → 0.4 so config values, port numbers, retention days aren't dropped
     digit_chars = sum(c.isdigit() for c in stripped)
-    if digit_chars / max(len(stripped), 1) > 0.2:
+    if digit_chars / max(len(stripped), 1) > 0.4:
         return True
 
     # Low alpha ratio — garbled OCR, UI nav artifacts, symbol dumps
+    # Lowered from 0.45 → 0.3 so mixed content (tables, CLI, config) survives
     alpha_chars = sum(c.isalpha() for c in stripped)
-    if alpha_chars / max(len(stripped), 1) < 0.45:
+    if alpha_chars / max(len(stripped), 1) < 0.3:
         return True
 
     # Repeated standalone numbers — screenshot/table row dumps (e.g. "90 90 90 0.0 GB")
+    # Raised from 8 → 20 so config/port lists aren't killed
     standalone_nums = re.findall(r'\b\d+\b', stripped)
-    if len(standalone_nums) > 8:
+    if len(standalone_nums) > 20:
         return True
 
     # UI navigation symbols

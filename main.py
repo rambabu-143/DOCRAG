@@ -73,23 +73,31 @@ def cmd_query(question: str | None = None):
 
 
 def _ask(chain, retriever, question: str):
-    with console.status("[bold yellow]Searching and generating...[/bold yellow]"):
+    # 1. Retrieve once
+    with console.status("[bold yellow]Searching docs...[/bold yellow]"):
         try:
-            # Retrieve docs first (to show sources)
             docs = retriever.invoke(question)
-            answer = chain.invoke(question)
         except Exception as e:
             console.print(f"[red]Error:[/red] {e}")
             return
 
-    # Print answer
+    from chain import format_docs_with_sources
+    context = format_docs_with_sources(docs)
+
+    # 2. Stream the answer — bypass Rich buffer so every chunk prints immediately
     console.print()
-    console.print(Panel(
-        Markdown(answer),
-        title="[bold blue]Answer[/bold blue]",
-        border_style="blue",
-        padding=(1, 2),
-    ))
+    console.rule("[bold blue]Answer[/bold blue]", style="blue")
+    answer_parts: list[str] = []
+    try:
+        for chunk in chain.stream({"context": context, "question": question}):
+            print(chunk, end="", flush=True)  # flush=True ensures no buffering cutoff
+            answer_parts.append(chunk)
+    except Exception as e:
+        console.print(f"\n[red]Error:[/red] {e}")
+        return
+    import sys; sys.stdout.flush()
+    console.print()
+    console.rule(style="blue")
 
     # Print sources table
     seen: set[tuple] = set()
