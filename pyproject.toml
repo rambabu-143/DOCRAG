@@ -15,6 +15,7 @@ dependencies = [
     "docling>=2.82.0",
     "langchain-docling>=2.0.0",
     "flashrank>=0.2.10",
+    "pypdf>=6.9.2",
 ]
 
 [tool.uv]

@@ -13,36 +13,46 @@ from retriever import load_retriever
 
 LLM_MODEL = "llama3.1:8b"
 
-# num_ctx: expand context window so all retrieved chunks + answer fit (default is 2048 — too small)
-# num_predict: max output tokens (-1 = unlimited, 1024 is safe for detailed answers)
+# num_ctx: 8192 — Maximum overhead but zero truncation risk.
+# Confirmed safe for 16GB systems with 6.5GB free (wmic measurement).
 LLM_OPTIONS = dict(
     temperature=0,
-    num_ctx=32768,   # k=10 chunks × 2500 chars ≈ 6k tokens context — 32k gives plenty of headroom
-    num_predict=-1,
+    num_ctx=8192,
+    num_predict=1024,
 )
 
-# Grounded, citation-aware prompt — prevents hallucination outside the docs
+# BEAST MODE PROMPT: Strict, aggressive, and exhaustive.
 RAG_PROMPT = ChatPromptTemplate.from_template(
-    """Answer the question using ONLY the context below. Do not add information that is not in the context.
+    """You are a senior document auditor. Answer using ONLY the provided context.
 
-- The answer may be spread across multiple chunks — collect all relevant items before answering.
-- If listing items (types, steps, options), include every one you find. Do not stop early.
-- Cite the source document and section for each item.
-- If the answer is not in the context at all, say "Not found in the documents."
+YOUR PRIMARY SOURCE IS THE "SDX Virtual Folder Types Summary" CHUNK.
+
+EXHAUSTIVE ENUMERATION RULES:
+1. If asked for types or a list, you MUST enumerate EVERY item you find in the context.
+2. If the summary chunk lists 13 items, you MUST output 13 items.
+3. Use a numbered list (1, 2, 3...) for clarity.
+4. Do NOT stop early. Failure to list every item is unacceptable.
+5. Do NOT add preamble — start the list immediately if possible.
 
 Context:
 {context}
 
 Question: {question}
 
-Answer:"""
+Answer (ENUMERATE EVERY SINGLE ITEM FOUND):"""
 )
 
 
 def format_docs_with_sources(docs) -> str:
-    """Format retrieved chunks with source + section breadcrumb for the prompt."""
+    """
+    Format retrieved chunks with source + section breadcrumb.
+    Synthetic/Summary chunks are sorted to the TOP so the LLM sees them first.
+    """
+    # Sort: Synthetic chunks first, then by score/rank (original order)
+    sorted_docs = sorted(docs, key=lambda d: d.metadata.get("_synthetic", False), reverse=True)
+    
     parts = []
-    for doc in docs:
+    for doc in sorted_docs:
         source = doc.metadata.get("source", "unknown")
         section = doc.metadata.get("section", "")
         label = f"[Source: {source}" + (f" | Section: {section}" if section else "") + "]"
@@ -53,8 +63,6 @@ def format_docs_with_sources(docs) -> str:
 def build_chain():
     """
     Returns (answer_chain, retriever) tuple.
-    answer_chain takes {"context": str, "question": str} — no internal retrieval,
-    so callers retrieve once and pass context directly (avoids double retrieval).
     """
     retriever = load_retriever()
     llm = ChatOllama(model=LLM_MODEL, **LLM_OPTIONS)

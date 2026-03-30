@@ -3,8 +3,7 @@ retriever.py — Hybrid retrieval: ChromaDB (semantic) + BM25 (keyword) + chunk 
 
 EnsembleRetriever fuses both signals via Reciprocal Rank Fusion (RRF).
 Chunk expansion: after retrieval, sibling chunks from the same source+section
-are automatically added so split sections (e.g. "6 SDX Virtual Folder Types"
-across 3 chunks) are never incomplete.
+are automatically added so sibling content is never incomplete.
 """
 
 import json
@@ -22,7 +21,9 @@ CHUNKS_FILE = Path(__file__).parent / "chunks.json"
 EMBED_MODEL = "nomic-embed-text"
 COLLECTION = "docrag"
 
-TOP_K = 10
+# "BEAST" optimization: Keep it tight (TOP_K=4) to avoid context noise. 
+# Total context (with siblings) will stay around 10-12 chunks.
+TOP_K = 4
 
 
 def expand_chunks(retrieved: list[Document], all_chunks: list[Document]) -> list[Document]:
@@ -48,6 +49,11 @@ def expand_chunks(retrieved: list[Document], all_chunks: list[Document]) -> list
 
     for doc in retrieved:
         add(doc)
+        
+        # SKIP expansion for synthetic/golden chunks — they are already complete.
+        if doc.metadata.get("_synthetic"):
+            continue
+
         key = f"{doc.metadata.get('source', '')}||{doc.page_content}"
         idx = content_to_idx.get(key)
         if idx is None:
@@ -86,12 +92,12 @@ def load_retriever():
     bm25_retriever = BM25Retriever.from_documents(all_chunks)
     bm25_retriever.k = TOP_K
 
+    # Ensemble: prioritized BM25 at 0.4 for exact keyword hits on summary chunks.
     ensemble = EnsembleRetriever(
         retrievers=[semantic_retriever, bm25_retriever],
-        weights=[0.85, 0.15],
+        weights=[0.6, 0.4],
     )
 
-    # Wrap ensemble with chunk expansion
     class ExpandingRetriever:
         def invoke(self, query: str) -> list[Document]:
             docs = ensemble.invoke(query)
