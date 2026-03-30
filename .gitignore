@@ -4,6 +4,8 @@
 # Generated at runtime — re-created by running ingest
 chroma_db/
 chunks.json
+image_cache.json
+pdf_hashes.json
 
 # PDFs (large binary files — store separately)
 *.pdf
